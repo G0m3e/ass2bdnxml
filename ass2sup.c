@@ -1,27 +1,169 @@
-/*----------------------------------------------------------------------------
- * ass2bdnxml - Generates BluRay subtitle stuff from ass/ssa subtitles
- * based on avs2bdnxml 2.08
- * Copyright (C) 2008-2013 Arne Bochem <avs2bdnxml at ps-auxw de>
- * Copyright (C) 2022-2022 Masaiki <mydarer@gmail.com>
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *----------------------------------------------------------------------------*/
+#include "ass2sup.h"
 #include "common.h"
-// codes from assrender end here
+#include <stdio.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
-int main (int argc, char *argv[])
+#define NUM_THREADS 16
+
+typedef struct {
+    int thread_id;
+    int init_frame;
+    int last_frame;
+    ass_input_t *ass_context;
+    stream_info_t *s_info;
+    int have_line;
+    int sup_output;
+    int xml_output;
+    sup_writer_t *sw;
+    int n_crop;
+    int to;
+    int split_at;
+    int min_split;
+    int stricter;
+    event_list_t *events;
+    int buffer_opt;
+    pic_t pic;
+    int ugly;
+    int even_y;
+    int autocrop;
+    int pal_png;
+    char* png_dir;
+} ThreadData;
+
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER; // 互斥锁
+atomic_int num_of_events = 0;                      // 共享计数
+
+static ProgressCallback progress_callback = NULL;  // 保存回调函数指针
+volatile int stopFlag = 0;
+
+void ass2sup_reg_callback(ProgressCallback callback)
 {
+    progress_callback = callback;
+}
+
+int process_frames(ThreadData* arg)
+{
+    char *in_img = NULL, *old_img = NULL, *tmp = NULL, *out_buf = NULL;
+    int changed = 1;
+    int first_frame = -1;
+    int checked_empty = 0;
+    int have_line = 0;
+    int must_zero = 0;
+    int n_crop = 1;
+    uint32_t *pal = NULL;
+    crop_t crops[2];
+    int start_frame = -1;
+    int end_frame = -1;
+    ThreadData* data = (ThreadData*)arg;
+    in_img  = calloc(data->s_info->i_width * data->s_info->i_height * 4 + 16 * 2, sizeof(char)); /* allocate + 16 for alignment, and + n * 16 for over read/write */
+    old_img = calloc(data->s_info->i_width * data->s_info->i_height * 4 + 16 * 2, sizeof(char)); /* see above */
+    out_buf = calloc(data->s_info->i_width * data->s_info->i_height * 4 + 16 * 2, sizeof(char));
+    for (int i = data->init_frame; i <= data->last_frame; i++)
+    {
+        if(stopFlag)
+        {
+            return 2;
+        }
+		long long ts = (long double)i * data->s_info->i_fps_den / data->s_info->i_fps_num * 1000;
+
+		ASS_Image *img = ass_render_frame(data->ass_context->ass_renderer, data->ass_context->ass, ts, &changed);
+		memset(in_img, 0, data->s_info->i_width * data->s_info->i_height * 4);
+		make_sub_img(img, in_img, data->s_info->i_width);
+
+		checked_empty = 0;
+
+		/* Progress indicator */
+		// if (i % (count_frames / progress_step) == 0)
+		// {
+		// 	fprintf(stderr, "\rProgress: %d/%d - Lines: %d", i - init_frame, count_frames, num_of_events);
+		// }
+
+		/* If we are outside any lines, check for empty frames first */
+		if (!have_line)
+		{
+			if (is_empty(data->s_info, in_img))
+				continue;
+			else
+				checked_empty = 1;
+		}
+
+		/* Check for duplicate, unless first frame */
+		if ((i != data->init_frame) && have_line && !changed)
+			continue;
+		/* Mark frames that were not used as new image in comparison to have transparent pixels zeroed */
+		else if (!(i && have_line))
+			must_zero = 1;
+
+		/* Not a dup, write end-of-line, if we had a line before */
+
+		if (have_line)
+		{
+			if (data->sup_output)
+			{
+				assert(pal != NULL);
+				write_sup_wrapper(data->sw, (uint8_t *)out_buf, n_crop, crops, pal, start_frame + data->to, i + data->to, data->split_at, data->min_split, data->stricter);
+				if (!data->xml_output)
+					free(pal);
+				pal = NULL;
+			}
+			if (data->xml_output)
+				add_event_xml(data->events, data->split_at, data->min_split, start_frame + data->to, i + data->to, n_crop, crops);
+			end_frame = i;
+			have_line = 0;
+		}
+
+		/* Check for empty frame, if we didn't before */
+		if (!checked_empty && is_empty(data->s_info, in_img))
+			continue;
+
+		/* Zero transparent pixels, if needed */
+		if (must_zero)
+			zero_transparent(data->s_info, in_img);
+		must_zero = 0;
+
+		/* Not an empty frame, start line */
+		have_line = 1;
+		start_frame = i;
+		swap_rb(data->s_info, in_img, out_buf);
+		if (data->buffer_opt)
+			n_crop = auto_split(data->pic, crops, data->ugly, data->even_y);
+		else if (data->autocrop)
+		{
+			crops[0].x = 0;
+			crops[0].y = 0;
+			crops[0].w = data->pic.w;
+			crops[0].h = data->pic.h;
+			auto_crop(data->pic, crops);
+		}
+		if ((data->buffer_opt || data->autocrop) && data->even_y)
+			enforce_even_y(crops, n_crop);
+		if ((data->pal_png || data->sup_output) && pal == NULL)
+			pal = palletize(out_buf, data->s_info->i_width, data->s_info->i_height);
+		if (data->xml_output)
+			for (int j = 0; j < n_crop; j++)
+				write_png(data->png_dir, start_frame, (uint8_t *)out_buf, data->s_info->i_width, data->s_info->i_height, j, pal, crops[j]);
+		if (data->pal_png && data->xml_output && !data->sup_output)
+		{
+			free(pal);
+			pal = NULL;
+		}
+		num_of_events++;
+		if (first_frame == -1)
+			first_frame = i;
+
+		/* Save image for next comparison. */
+		tmp = in_img;
+		in_img = old_img;
+		old_img = tmp;
+    }
+}
+
+int ass2sup_process(const char* ass_filename, const char* outFileName, const char* language, const char* video_format, const char* frame_rate)
+{
+    int result = 0;
 	struct framerate_entry_s framerates[] = { {"23.976", "23.976", 24, 0, 24000, 1001}
 											/*, {"23.976d", "23.976", 24000/1001.0, 1}*/
 											, {"24", "24", 24, 0, 24, 1}
@@ -35,11 +177,10 @@ int main (int argc, char *argv[])
 											/*, {"59.94d", "59.94", 60000/1001.0, 1}*/
 											, {NULL, NULL, 0, 0, 0, 0}
 											};
-	char *ass_filename = NULL;
 	char *track_name = "Undefined";
-	char *language = "und";
-	char *video_format = "1080p";
-	char *frame_rate = "23.976";
+	// char *language = "und";
+	// char *video_format = "1080p";
+	// char *frame_rate = "23.976";
 	char *out_filename[2] = {NULL, NULL};
 	char *sup_output_fn = NULL;
 	char *xml_output_fn = NULL;
@@ -100,124 +241,6 @@ int main (int argc, char *argv[])
 	event_list_t *events = event_list_new();
 	event_t *event;
 	FILE *fh;
-
-	/* Get args */
-	if (argc < 2)
-	{
-		print_usage();
-		return 0;
-	}
-	while (1)
-	{
-		static struct option long_options[] =
-			{ {"output",       required_argument, 0, 'o'}
-			, {"seek",         required_argument, 0, 'j'}
-			, {"count",        required_argument, 0, 'c'}
-			, {"trackname",    required_argument, 0, 't'}
-			, {"language",     required_argument, 0, 'l'}
-			, {"video-format", required_argument, 0, 'v'}
-			, {"fps",          required_argument, 0, 'f'}
-			, {"x-offset",     required_argument, 0, 'x'}
-			, {"y-offset",     required_argument, 0, 'y'}
-			, {"t-offset",     required_argument, 0, 'd'}
-			, {"split-at",     required_argument, 0, 's'}
-			, {"min-split",    required_argument, 0, 'm'}
-			, {"autocrop",     required_argument, 0, 'a'}
-			, {"even-y",       required_argument, 0, 'e'}
-			, {"palette",      required_argument, 0, 'p'}
-			, {"buffer-opt",   required_argument, 0, 'b'}
-			, {"ugly",         required_argument, 0, 'u'}
-			, {"null-xml",     required_argument, 0, 'n'}
-			, {"stricter",     required_argument, 0, 'z'}
-			, {"font-dir",     required_argument, 0, 'g'}
-			, {0, 0, 0, 0}
-			};
-			int option_index = 0;
-
-			c = getopt_long(argc, argv, "o:j:c:t:l:v:f:x:y:d:b:s:m:e:p:a:u:n:z:g:", long_options, &option_index);
-			if (c == -1)
-				break;
-			switch (c)
-			{
-				case 'o':
-					if (out_filename_idx < 2)
-						out_filename[out_filename_idx++] = optarg;
-					else
-					{
-						fprintf(stderr, "No more than two output filenames allowed.\nIf more than one is used, the other must have a\ndifferent output format.\n");
-						exit(0);
-					}
-					break;
-				case 'j':
-					seek_string = optarg;
-					break;
-				case 'c':
-					count_string = optarg;
-					break;
-				case 't':
-					track_name = optarg;
-					break;
-				case 'l':
-					language = optarg;
-					break;
-				case 'v':
-					video_format = optarg;
-					break;
-				case 'f':
-					frame_rate = optarg;
-					break;
-				case 'x':
-					x_offset = optarg;
-					break;
-				case 'y':
-					y_offset = optarg;
-					break;
-				case 'd':
-					t_offset = optarg;
-					break;
-				case 'e':
-					even_y_string = optarg;
-					break;
-				case 'p':
-					palletize_png = optarg;
-					break;
-				case 'a':
-					auto_crop_image = optarg;
-					break;
-				case 'b':
-					buffer_optimize = optarg;
-					break;
-				case 's':
-					split_after = optarg;
-					break;
-				case 'm':
-					minimum_split = optarg;
-					break;
-				case 'u':
-					ugly_option = optarg;
-					break;
-				case 'n':
-					allow_empty_string = optarg;
-					break;
-				case 'z':
-					stricter_string = optarg;
-					break;
-				case 'g':
-					additional_font_dir = optarg;
-					break;
-				default:
-					print_usage();
-					return 0;
-					break;
-			}
-	}
-	if (argc - optind == 1)
-		ass_filename = argv[optind];
-	else
-	{
-		fprintf(stderr, "Only a single input file allowed.\n");
-		return 1;
-	}
 
 	/* Both input and output filenames are required */
 	if (ass_filename == NULL)
@@ -407,100 +430,48 @@ int main (int argc, char *argv[])
 
 	/* Process frames */
 	ass_set_line_spacing(ass_context->ass_renderer, 48.0);
-	for (i = init_frame; i < last_frame; i++)
-	{
-		long long ts = (long double)i * s_info->i_fps_den / s_info->i_fps_num * 1000;
 
-		ASS_Image *img = ass_render_frame(ass_context->ass_renderer, ass_context->ass, ts, &changed);
-		memset(in_img, 0, s_info->i_width *s_info->i_height * 4);
-		make_sub_img(img, in_img, s_info->i_width);
+    /* Process frames */
+    int frames_per_thread = count_frames / NUM_THREADS;
 
-		checked_empty = 0;
+    pthread_t threads[NUM_THREADS];
+    ThreadData thread_data[NUM_THREADS];
 
-		/* Progress indicator */
-		if (i % (count_frames / progress_step) == 0)
-		{
-			fprintf(stderr, "\rProgress: %d/%d - Lines: %d", i - init_frame, count_frames, num_of_events);
-		}
+    for (int i = 0; i < NUM_THREADS; i++) {
+        thread_data[i].thread_id = i;
+        thread_data[i].init_frame = init_frame + i * frames_per_thread;
+        thread_data[i].last_frame = (i == NUM_THREADS - 1) ? last_frame : (thread_data[i].init_frame + frames_per_thread - 1);
+        thread_data[i].ass_context = ass_context;
+        thread_data[i].s_info = s_info;
+        thread_data[i].have_line = have_line;
+        thread_data[i].sup_output = sup_output;
+        thread_data[i].xml_output = xml_output;
+        thread_data[i].sw = sw;
+        thread_data[i].n_crop = n_crop;
+        thread_data[i].to = to;
+        thread_data[i].split_at = split_at;
+        thread_data[i].min_split = min_split;
+        thread_data[i].stricter = stricter;
+        thread_data[i].events = events;
+        thread_data[i].buffer_opt = buffer_opt;
+        thread_data[i].pic = pic;
+        thread_data[i].ugly = ugly;
+        thread_data[i].even_y = even_y;
+        thread_data[i].autocrop = autocrop;
+        thread_data[i].pal_png = pal_png;
+        thread_data[i].png_dir = png_dir;
+        pthread_create(&threads[i], NULL, process_frames, &thread_data[i]);
+    }
 
-		/* If we are outside any lines, check for empty frames first */
-		if (!have_line)
-		{
-			if (is_empty(s_info, in_img))
-				continue;
-			else
-				checked_empty = 1;
-		}
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_join(threads[i], NULL);
+    }
 
-		/* Check for duplicate, unless first frame */
-		if ((i != init_frame) && have_line && !changed)
-			continue;
-		/* Mark frames that were not used as new image in comparison to have transparent pixels zeroed */
-		else if (!(i && have_line))
-			must_zero = 1;
-
-		/* Not a dup, write end-of-line, if we had a line before */
-
-		if (have_line)
-		{
-			if (sup_output)
-			{
-				assert(pal != NULL);
-				write_sup_wrapper(sw, (uint8_t *)out_buf, n_crop, crops, pal, start_frame + to, i + to, split_at, min_split, stricter);
-				if (!xml_output)
-					free(pal);
-				pal = NULL;
-			}
-			if (xml_output)
-				add_event_xml(events, split_at, min_split, start_frame + to, i + to, n_crop, crops);
-			end_frame = i;
-			have_line = 0;
-		}
-
-		/* Check for empty frame, if we didn't before */
-		if (!checked_empty && is_empty(s_info, in_img))
-			continue;
-
-		/* Zero transparent pixels, if needed */
-		if (must_zero)
-			zero_transparent(s_info, in_img);
-		must_zero = 0;
-
-		/* Not an empty frame, start line */
-		have_line = 1;
-		start_frame = i;
-		swap_rb(s_info, in_img, out_buf);
-		if (buffer_opt)
-			n_crop = auto_split(pic, crops, ugly, even_y);
-		else if (autocrop)
-		{
-			crops[0].x = 0;
-			crops[0].y = 0;
-			crops[0].w = pic.w;
-			crops[0].h = pic.h;
-			auto_crop(pic, crops);
-		}
-		if ((buffer_opt || autocrop) && even_y)
-			enforce_even_y(crops, n_crop);
-		if ((pal_png || sup_output) && pal == NULL)
-			pal = palletize(out_buf, s_info->i_width, s_info->i_height);
-		if (xml_output)
-			for (j = 0; j < n_crop; j++)
-				write_png(png_dir, start_frame, (uint8_t *)out_buf, s_info->i_width, s_info->i_height, j, pal, crops[j]);
-		if (pal_png && xml_output && !sup_output)
-		{
-			free(pal);
-			pal = NULL;
-		}
-		num_of_events++;
-		if (first_frame == -1)
-			first_frame = i;
-
-		/* Save image for next comparison. */
-		tmp = in_img;
-		in_img = old_img;
-		old_img = tmp;
-	}
+    if(stopFlag)
+    {
+        result = 2;
+        goto cleanup;
+    }
 
 	fprintf(stderr, "\rProgress: %d/%d - Lines: %d - Done\n", i - init_frame, count_frames, num_of_events);
 
@@ -615,5 +586,12 @@ int main (int argc, char *argv[])
 	fprintf(stderr, "Time elapsed: %lld\n", time(NULL) - bench_start);
 
 	return 0;
+cleanup:
+    stopFlag = 0;
+    return result;
 }
 
+void avs2sup_stop()
+{
+    stopFlag = 1;
+}
