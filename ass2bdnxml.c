@@ -18,6 +18,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *----------------------------------------------------------------------------*/
 #include "common.h"
+#include <pthread.h>
 // codes from assrender end here
 
 int main (int argc, char *argv[])
@@ -57,6 +58,7 @@ int main (int argc, char *argv[])
 	char *allow_empty_string = "0";
 	char *stricter_string = "0";
 	char *count_string = "2147483647";
+	char * num_threads_string = "4";
 	char *in_img = NULL, *old_img = NULL, *tmp = NULL, *out_buf = NULL;
 	char *intc_buf = NULL, *outtc_buf = NULL;
 	char *drop_frame = NULL;
@@ -94,8 +96,7 @@ int main (int argc, char *argv[])
 	int xml_output = 0;
 	int allow_empty = 0;
 	int stricter = 0;
-	sup_writer_t *sw = NULL;
-	ass_input_t *ass_context;
+	int num_threads = 4;
 	stream_info_t *s_info = malloc(sizeof(stream_info_t));
 	event_list_t *events = event_list_new();
 	event_t *event;
@@ -130,11 +131,12 @@ int main (int argc, char *argv[])
 			, {"null-xml",     required_argument, 0, 'n'}
 			, {"stricter",     required_argument, 0, 'z'}
 			, {"font-dir",     required_argument, 0, 'g'}
+			, {"thread-num",   required_argument, 0, 'i'}
 			, {0, 0, 0, 0}
 			};
 			int option_index = 0;
 
-			c = getopt_long(argc, argv, "o:j:c:t:l:v:f:x:y:d:b:s:m:e:p:a:u:n:z:g:", long_options, &option_index);
+			c = getopt_long(argc, argv, "o:j:c:t:l:v:f:x:y:d:b:s:m:e:p:a:u:n:z:g:i:", long_options, &option_index);
 			if (c == -1)
 				break;
 			switch (c)
@@ -205,6 +207,9 @@ int main (int argc, char *argv[])
 				case 'g':
 					additional_font_dir = optarg;
 					break;
+				case 'i':
+					num_threads_string = optarg;
+					break;
 				default:
 					print_usage();
 					return 0;
@@ -273,6 +278,13 @@ int main (int argc, char *argv[])
 	init_frame = parse_int(seek_string, "seek", NULL);
 	count_frames = parse_int(count_string, "count", NULL);
 	min_split = parse_int(minimum_split, "min-split", NULL);
+	num_threads = parse_int(num_threads_string, "thread-num", NULL);
+	if(num_threads <=0 || num_threads >16)
+	{
+		return -1;
+	}
+	ass_input_t *ass_context[num_threads];
+	sup_writer_t *sw[num_threads];
 	if (!min_split)
 		min_split = 1;
 
@@ -312,11 +324,15 @@ int main (int argc, char *argv[])
 	detect_sse2();*/
 
 	/* Get video info and allocate buffer */
-	if (open_file_ass(ass_filename, &ass_context, s_info))
+	for(int i = 0; i < num_threads; i++)
 	{
-		print_usage();
-		return 1;
+		if (open_file_ass(ass_filename, &ass_context[i], s_info))
+		{
+			print_usage();
+			return 1;
+		}
 	}
+
 
 	char *video_formats[] = { "2k","1440p","1080p","720p" };
 	int video_format_widths[] = { 2560,2560,1920,1280 };
@@ -337,13 +353,17 @@ int main (int argc, char *argv[])
 		}
 	}
 
-	ass_set_storage_size(ass_context->ass_renderer, s_info->i_width, s_info->i_height);
-	ass_set_frame_size(ass_context->ass_renderer, s_info->i_width, s_info->i_height);
+	for(int i = 0; i < num_threads; i++)
+	{
+		ass_set_storage_size(ass_context[i]->ass_renderer, s_info->i_width, s_info->i_height);
+		ass_set_frame_size(ass_context[i]->ass_renderer, s_info->i_width, s_info->i_height);
+	
+		if (additional_font_dir)
+			ass_set_fonts_dir(ass_context[i]->ass_library, additional_font_dir);
+	
+		ass_set_fonts(ass_context[i]->ass_renderer, NULL, NULL, ASS_FONTPROVIDER_AUTODETECT, NULL, 1);
+	}
 
-	if (additional_font_dir)
-		ass_set_fonts_dir(ass_context->ass_library, additional_font_dir);
-
-	ass_set_fonts(ass_context->ass_renderer, NULL, NULL, ASS_FONTPROVIDER_AUTODETECT, NULL, 1);
 
 	in_img  = calloc(s_info->i_width * s_info->i_height * 4 + 16 * 2, sizeof(char)); /* allocate + 16 for alignment, and + n * 16 for over read/write */
 	old_img = calloc(s_info->i_width * s_info->i_height * 4 + 16 * 2, sizeof(char)); /* see above */
@@ -374,7 +394,8 @@ int main (int argc, char *argv[])
 	crops[0].h = pic.h;
 
 	/* Get frame number */
-	frames = get_frame_total_ass(ass_context, s_info);
+	frames = get_frame_total_ass(ass_context[i], s_info);
+	
 	if (count_frames + init_frame > frames)
 	{
 		count_frames = frames - init_frame;
@@ -399,108 +420,53 @@ int main (int argc, char *argv[])
 			progress_step = 1;
 	}
 
-	/* Open SUP writer, if applicable */
-	if (sup_output)
-		sw = new_sup_writer(sup_output_fn, pic.w, pic.h, fps_num, fps_den);
-
 	int changed = 1;
 
 	/* Process frames */
-	ass_set_line_spacing(ass_context->ass_renderer, 48.0);
-	for (i = init_frame; i < last_frame; i++)
+	for(int i = 0; i < num_threads; i++)
 	{
-		long long ts = (long double)i * s_info->i_fps_den / s_info->i_fps_num * 1000;
-
-		ASS_Image *img = ass_render_frame(ass_context->ass_renderer, ass_context->ass, ts, &changed);
-		memset(in_img, 0, s_info->i_width *s_info->i_height * 4);
-		make_sub_img(img, in_img, s_info->i_width);
-
-		checked_empty = 0;
-
-		/* Progress indicator */
-		if (i % (count_frames / progress_step) == 0)
+			/* Open SUP writer, if applicable */
+		if (sup_output)
 		{
-			fprintf(stderr, "\rProgress: %d/%d - Lines: %d", i - init_frame, count_frames, num_of_events);
+			sw[i] = new_sup_writer(sup_output_fn, pic.w, pic.h, fps_num, fps_den);
 		}
-
-		/* If we are outside any lines, check for empty frames first */
-		if (!have_line)
-		{
-			if (is_empty(s_info, in_img))
-				continue;
-			else
-				checked_empty = 1;
-		}
-
-		/* Check for duplicate, unless first frame */
-		if ((i != init_frame) && have_line && !changed)
-			continue;
-		/* Mark frames that were not used as new image in comparison to have transparent pixels zeroed */
-		else if (!(i && have_line))
-			must_zero = 1;
-
-		/* Not a dup, write end-of-line, if we had a line before */
-
-		if (have_line)
-		{
-			if (sup_output)
-			{
-				assert(pal != NULL);
-				write_sup_wrapper(sw, (uint8_t *)out_buf, n_crop, crops, pal, start_frame + to, i + to, split_at, min_split, stricter);
-				if (!xml_output)
-					free(pal);
-				pal = NULL;
-			}
-			if (xml_output)
-				add_event_xml(events, split_at, min_split, start_frame + to, i + to, n_crop, crops);
-			end_frame = i;
-			have_line = 0;
-		}
-
-		/* Check for empty frame, if we didn't before */
-		if (!checked_empty && is_empty(s_info, in_img))
-			continue;
-
-		/* Zero transparent pixels, if needed */
-		if (must_zero)
-			zero_transparent(s_info, in_img);
-		must_zero = 0;
-
-		/* Not an empty frame, start line */
-		have_line = 1;
-		start_frame = i;
-		swap_rb(s_info, in_img, out_buf);
-		if (buffer_opt)
-			n_crop = auto_split(pic, crops, ugly, even_y);
-		else if (autocrop)
-		{
-			crops[0].x = 0;
-			crops[0].y = 0;
-			crops[0].w = pic.w;
-			crops[0].h = pic.h;
-			auto_crop(pic, crops);
-		}
-		if ((buffer_opt || autocrop) && even_y)
-			enforce_even_y(crops, n_crop);
-		if ((pal_png || sup_output) && pal == NULL)
-			pal = palletize(out_buf, s_info->i_width, s_info->i_height);
-		if (xml_output)
-			for (j = 0; j < n_crop; j++)
-				write_png(png_dir, start_frame, (uint8_t *)out_buf, s_info->i_width, s_info->i_height, j, pal, crops[j]);
-		if (pal_png && xml_output && !sup_output)
-		{
-			free(pal);
-			pal = NULL;
-		}
-		num_of_events++;
-		if (first_frame == -1)
-			first_frame = i;
-
-		/* Save image for next comparison. */
-		tmp = in_img;
-		in_img = old_img;
-		old_img = tmp;
+		// ass_set_line_spacing(ass_context[i]->ass_renderer, -10);
 	}
+	
+	    /* Process frames */
+		int frames_per_thread = count_frames / num_threads;
+
+		pthread_t threads[num_threads];
+		ThreadData thread_data[num_threads];
+	
+		for (int i = 0; i < num_threads; i++) {
+			thread_data[i].thread_id = i;
+			thread_data[i].init_frame = init_frame + i * frames_per_thread;
+			thread_data[i].last_frame = (i == num_threads - 1) ? last_frame : (thread_data[i].init_frame + frames_per_thread - 1);
+			thread_data[i].ass_context = ass_context[i];
+			thread_data[i].s_info = s_info;
+			thread_data[i].have_line = have_line;
+			thread_data[i].sup_output = sup_output;
+			thread_data[i].xml_output = xml_output;
+			thread_data[i].sw = sw[i];
+			thread_data[i].n_crop = n_crop;
+			thread_data[i].to = to;
+			thread_data[i].split_at = split_at;
+			thread_data[i].min_split = min_split;
+			thread_data[i].stricter = stricter;
+			thread_data[i].events = events;
+			thread_data[i].buffer_opt = buffer_opt;
+			thread_data[i].ugly = ugly;
+			thread_data[i].even_y = even_y;
+			thread_data[i].autocrop = autocrop;
+			thread_data[i].pal_png = pal_png;
+			thread_data[i].png_dir = png_dir;
+			pthread_create(&threads[i], NULL, process_frames, &thread_data[i]);
+		}
+	
+		for (int i = 0; i < num_threads; i++) {
+			pthread_join(threads[i], NULL);
+		}
 
 	fprintf(stderr, "\rProgress: %d/%d - Lines: %d - Done\n", i - init_frame, count_frames, num_of_events);
 
@@ -525,9 +491,12 @@ int main (int argc, char *argv[])
 		end_frame = i - 1;
 	}
 
-	if (sup_output)
+	for(int i = 0; i < num_threads; i++)
 	{
-		close_sup_writer(sw);
+		if (sup_output)
+		{
+			close_sup_writer(sw[i]);
+		}
 	}
 
 	if (xml_output)
@@ -609,7 +578,10 @@ int main (int argc, char *argv[])
 	}
 
 	/* Cleanup */
-	close_file_ass(ass_context);
+	for(int i = 0; i < num_threads; i++)
+	{
+		close_file_ass(ass_context[i]);
+	}
 
 	/* Give runtime */
 	fprintf(stderr, "Time elapsed: %lld\n", time(NULL) - bench_start);

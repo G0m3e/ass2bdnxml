@@ -1,5 +1,10 @@
 #include "common.h"
 #include <string.h>
+#include <pthread.h>
+#include <stdatomic.h>
+
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER; // 互斥锁
+atomic_int num_of_events = 0;                      // 共享计数
 
 char *read_file_bytes(FILE *fp, size_t *bufsize)
 {
@@ -374,6 +379,7 @@ void print_usage()
 		"  -b, --buffer-opt <integer>   Optimize PG buffer size by image\n"
 		"                               splitting. [on=1, off=0]\n\n"
 		"  -g, --font-dir <string>      additional font dir for libass\n"
+		"  -i, --thread-num <string>    thread numbers. default=4\n"
 		"Example:\n"
 		"  ass2bdnxml -t Undefined -l und -v 1080p -f 23.976 -a1 -p1 -b0 -m3 \\\n"
 		"    -u0 -e0 -n0 -z0 -o output.xml input.ass\n"
@@ -558,4 +564,133 @@ void make_sub_img(ASS_Image *img, uint8_t *sub_img, uint32_t width)
 
 		img = img->next;
 	}
+}
+
+int process_frames(ThreadData* data)
+{
+    char *in_img = NULL, *old_img = NULL, *tmp = NULL, *out_buf = NULL;
+    int changed = 1;
+    int first_frame = -1;
+    int checked_empty = 0;
+    int have_line = 0;
+    int must_zero = 0;
+    int n_crop = 1;
+    uint32_t *pal = NULL;
+    crop_t crops[2];
+    int start_frame = -1;
+    int end_frame = -1;
+    in_img  = calloc(data->s_info->i_width * data->s_info->i_height * 4 + 16 * 2, sizeof(char)); /* allocate + 16 for alignment, and + n * 16 for over read/write */
+    old_img = calloc(data->s_info->i_width * data->s_info->i_height * 4 + 16 * 2, sizeof(char)); /* see above */
+    out_buf = calloc(data->s_info->i_width * data->s_info->i_height * 4 + 16 * 2, sizeof(char));
+	in_img  = in_img + (short)(16 - ((long)in_img % 16));
+	old_img = old_img + (short)(16 - ((long)old_img % 16));
+	out_buf = out_buf + (short)(16 - ((long)out_buf % 16));
+	pic_t pic;
+	pic.b = out_buf;
+	pic.w = data->s_info->i_width;
+	pic.h = data->s_info->i_height;
+	pic.s = data->s_info->i_width;
+    for (int i = data->init_frame; i <= data->last_frame; i++)
+    {
+        // if(stopFlag)
+        // {
+        //     return 2;
+        // }
+		long long ts = (long double)i * data->s_info->i_fps_den / data->s_info->i_fps_num * 1000;
+        // pthread_mutex_lock(&mutex);
+        ASS_Image *img = ass_render_frame(data->ass_context->ass_renderer, data->ass_context->ass, ts, &changed);
+		memset(in_img, 0, data->s_info->i_width * data->s_info->i_height * 4);
+		make_sub_img(img, in_img, data->s_info->i_width);
+		// pthread_mutex_unlock(&mutex);
+
+		checked_empty = 0;
+
+		/* Progress indicator */
+		// if (i % (count_frames / progress_step) == 0)
+		// {
+		// 	fprintf(stderr, "\rProgress: %d/%d - Lines: %d", i - init_frame, count_frames, num_of_events);
+		// }
+
+		/* If we are outside any lines, check for empty frames first */
+		if (!have_line)
+		{
+			if (is_empty(data->s_info, in_img))
+				continue;
+			else
+				checked_empty = 1;
+		}
+
+		/* Check for duplicate, unless first frame */
+		if ((i != data->init_frame) && have_line && !changed)
+			continue;
+		/* Mark frames that were not used as new image in comparison to have transparent pixels zeroed */
+		else if (!(i && have_line))
+			must_zero = 1;
+
+		/* Not a dup, write end-of-line, if we had a line before */
+
+		if (have_line)
+		{
+			if (data->sup_output)
+			{
+				assert(pal != NULL);
+				write_sup_wrapper(data->sw, (uint8_t *)out_buf, n_crop, crops, pal, start_frame + data->to, i + data->to, data->split_at, data->min_split, data->stricter);
+				if (!data->xml_output)
+					free(pal);
+				pal = NULL;
+			}
+			if (data->xml_output)
+				add_event_xml(data->events, data->split_at, data->min_split, start_frame + data->to, i + data->to, n_crop, crops);
+			end_frame = i;
+			have_line = 0;
+		}
+
+		/* Check for empty frame, if we didn't before */
+		if (!checked_empty && is_empty(data->s_info, in_img))
+			continue;
+
+		/* Zero transparent pixels, if needed */
+		if (must_zero)
+			zero_transparent(data->s_info, in_img);
+		must_zero = 0;
+
+		/* Not an empty frame, start line */
+		have_line = 1;
+		start_frame = i;
+		swap_rb(data->s_info, in_img, out_buf);
+		if (data->buffer_opt)
+			n_crop = auto_split(pic, crops, data->ugly, data->even_y);
+		else if (data->autocrop)
+		{
+			crops[0].x = 0;
+			crops[0].y = 0;
+			crops[0].w = pic.w;
+			crops[0].h = pic.h;
+			auto_crop(pic, crops);
+		}
+		if ((data->buffer_opt || data->autocrop) && data->even_y)
+			enforce_even_y(crops, n_crop);
+		if ((data->pal_png || data->sup_output) && pal == NULL)
+			pal = palletize(out_buf, data->s_info->i_width, data->s_info->i_height);
+		if (data->xml_output)
+			for (int j = 0; j < n_crop; j++)
+			{
+				write_png(data->png_dir, start_frame, (uint8_t *)out_buf, data->s_info->i_width, data->s_info->i_height, j, pal, crops[j]);
+				printf("Processing %d frames\n", num_of_events);
+				num_of_events++;
+			}
+		if (data->pal_png && data->xml_output && !data->sup_output)
+		{
+			free(pal);
+			pal = NULL;
+		}
+		// num_of_events++;
+		if (first_frame == -1)
+			first_frame = i;
+
+		/* Save image for next comparison. */
+		tmp = in_img;
+		in_img = old_img;
+		old_img = tmp;
+    }
 }

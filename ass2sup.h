@@ -10,7 +10,7 @@ void ass2sup_reg_callback(ProgressCallback callback);
 
 void ass2sup_stop();
 
-int ass2sup_process(const char* assFile, const char* outFileName, const char* langCode, const char* video_format, const char* frame_rate);
+int ass2sup_process(const char* assFile, char *out_filename[2], const char* langCode, const char* video_format, const char* frame_rate, int num_threads);
 
 #ifdef __cplusplus
 }

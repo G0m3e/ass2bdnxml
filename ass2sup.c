@@ -6,33 +6,6 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
-#define NUM_THREADS 16
-
-typedef struct {
-    int thread_id;
-    int init_frame;
-    int last_frame;
-    ass_input_t *ass_context;
-    stream_info_t *s_info;
-    int have_line;
-    int sup_output;
-    int xml_output;
-    sup_writer_t *sw;
-    int n_crop;
-    int to;
-    int split_at;
-    int min_split;
-    int stricter;
-    event_list_t *events;
-    int buffer_opt;
-    pic_t pic;
-    int ugly;
-    int even_y;
-    int autocrop;
-    int pal_png;
-    char* png_dir;
-} ThreadData;
-
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER; // 互斥锁
 atomic_int num_of_events = 0;                      // 共享计数
 
@@ -44,125 +17,12 @@ void ass2sup_reg_callback(ProgressCallback callback)
     progress_callback = callback;
 }
 
-int process_frames(ThreadData* arg)
+int ass2sup_process(const char* ass_filename, char *out_filename[2], const char* language, const char* video_format, const char* frame_rate, int num_threads)
 {
-    char *in_img = NULL, *old_img = NULL, *tmp = NULL, *out_buf = NULL;
-    int changed = 1;
-    int first_frame = -1;
-    int checked_empty = 0;
-    int have_line = 0;
-    int must_zero = 0;
-    int n_crop = 1;
-    uint32_t *pal = NULL;
-    crop_t crops[2];
-    int start_frame = -1;
-    int end_frame = -1;
-    ThreadData* data = (ThreadData*)arg;
-    in_img  = calloc(data->s_info->i_width * data->s_info->i_height * 4 + 16 * 2, sizeof(char)); /* allocate + 16 for alignment, and + n * 16 for over read/write */
-    old_img = calloc(data->s_info->i_width * data->s_info->i_height * 4 + 16 * 2, sizeof(char)); /* see above */
-    out_buf = calloc(data->s_info->i_width * data->s_info->i_height * 4 + 16 * 2, sizeof(char));
-    for (int i = data->init_frame; i <= data->last_frame; i++)
-    {
-        if(stopFlag)
-        {
-            return 2;
-        }
-		long long ts = (long double)i * data->s_info->i_fps_den / data->s_info->i_fps_num * 1000;
-
-		ASS_Image *img = ass_render_frame(data->ass_context->ass_renderer, data->ass_context->ass, ts, &changed);
-		memset(in_img, 0, data->s_info->i_width * data->s_info->i_height * 4);
-		make_sub_img(img, in_img, data->s_info->i_width);
-
-		checked_empty = 0;
-
-		/* Progress indicator */
-		// if (i % (count_frames / progress_step) == 0)
-		// {
-		// 	fprintf(stderr, "\rProgress: %d/%d - Lines: %d", i - init_frame, count_frames, num_of_events);
-		// }
-
-		/* If we are outside any lines, check for empty frames first */
-		if (!have_line)
-		{
-			if (is_empty(data->s_info, in_img))
-				continue;
-			else
-				checked_empty = 1;
-		}
-
-		/* Check for duplicate, unless first frame */
-		if ((i != data->init_frame) && have_line && !changed)
-			continue;
-		/* Mark frames that were not used as new image in comparison to have transparent pixels zeroed */
-		else if (!(i && have_line))
-			must_zero = 1;
-
-		/* Not a dup, write end-of-line, if we had a line before */
-
-		if (have_line)
-		{
-			if (data->sup_output)
-			{
-				assert(pal != NULL);
-				write_sup_wrapper(data->sw, (uint8_t *)out_buf, n_crop, crops, pal, start_frame + data->to, i + data->to, data->split_at, data->min_split, data->stricter);
-				if (!data->xml_output)
-					free(pal);
-				pal = NULL;
-			}
-			if (data->xml_output)
-				add_event_xml(data->events, data->split_at, data->min_split, start_frame + data->to, i + data->to, n_crop, crops);
-			end_frame = i;
-			have_line = 0;
-		}
-
-		/* Check for empty frame, if we didn't before */
-		if (!checked_empty && is_empty(data->s_info, in_img))
-			continue;
-
-		/* Zero transparent pixels, if needed */
-		if (must_zero)
-			zero_transparent(data->s_info, in_img);
-		must_zero = 0;
-
-		/* Not an empty frame, start line */
-		have_line = 1;
-		start_frame = i;
-		swap_rb(data->s_info, in_img, out_buf);
-		if (data->buffer_opt)
-			n_crop = auto_split(data->pic, crops, data->ugly, data->even_y);
-		else if (data->autocrop)
-		{
-			crops[0].x = 0;
-			crops[0].y = 0;
-			crops[0].w = data->pic.w;
-			crops[0].h = data->pic.h;
-			auto_crop(data->pic, crops);
-		}
-		if ((data->buffer_opt || data->autocrop) && data->even_y)
-			enforce_even_y(crops, n_crop);
-		if ((data->pal_png || data->sup_output) && pal == NULL)
-			pal = palletize(out_buf, data->s_info->i_width, data->s_info->i_height);
-		if (data->xml_output)
-			for (int j = 0; j < n_crop; j++)
-				write_png(data->png_dir, start_frame, (uint8_t *)out_buf, data->s_info->i_width, data->s_info->i_height, j, pal, crops[j]);
-		if (data->pal_png && data->xml_output && !data->sup_output)
-		{
-			free(pal);
-			pal = NULL;
-		}
-		num_of_events++;
-		if (first_frame == -1)
-			first_frame = i;
-
-		/* Save image for next comparison. */
-		tmp = in_img;
-		in_img = old_img;
-		old_img = tmp;
-    }
-}
-
-int ass2sup_process(const char* ass_filename, const char* outFileName, const char* language, const char* video_format, const char* frame_rate)
-{
+	if(num_threads <=0 || num_threads >16)
+	{
+		return -1;
+	}
     int result = 0;
 	struct framerate_entry_s framerates[] = { {"23.976", "23.976", 24, 0, 24000, 1001}
 											/*, {"23.976d", "23.976", 24000/1001.0, 1}*/
@@ -181,7 +41,6 @@ int ass2sup_process(const char* ass_filename, const char* outFileName, const cha
 	// char *language = "und";
 	// char *video_format = "1080p";
 	// char *frame_rate = "23.976";
-	char *out_filename[2] = {NULL, NULL};
 	char *sup_output_fn = NULL;
 	char *xml_output_fn = NULL;
 	char *x_offset = "0";
@@ -235,8 +94,6 @@ int ass2sup_process(const char* ass_filename, const char* outFileName, const cha
 	int xml_output = 0;
 	int allow_empty = 0;
 	int stricter = 0;
-	sup_writer_t *sw = NULL;
-	ass_input_t *ass_context;
 	stream_info_t *s_info = malloc(sizeof(stream_info_t));
 	event_list_t *events = event_list_new();
 	event_t *event;
@@ -296,6 +153,8 @@ int ass2sup_process(const char* ass_filename, const char* outFileName, const cha
 	init_frame = parse_int(seek_string, "seek", NULL);
 	count_frames = parse_int(count_string, "count", NULL);
 	min_split = parse_int(minimum_split, "min-split", NULL);
+	ass_input_t *ass_context[num_threads];
+	sup_writer_t *sw[num_threads];
 	if (!min_split)
 		min_split = 1;
 
@@ -331,14 +190,14 @@ int ass2sup_process(const char* ass_filename, const char* outFileName, const cha
 	/* Get timecode offset. */
 	to = parse_tc(t_offset, fps);
 
-	/* Detect CPU features
-	detect_sse2();*/
-
 	/* Get video info and allocate buffer */
-	if (open_file_ass(ass_filename, &ass_context, s_info))
+	for(int i = 0; i < num_threads; i++)
 	{
-		print_usage();
-		return 1;
+		if (open_file_ass(ass_filename, &ass_context[i], s_info))
+		{
+			print_usage();
+			return 1;
+		}
 	}
 
 	char *video_formats[] = { "2k","1440p","1080p","720p" };
@@ -360,13 +219,16 @@ int ass2sup_process(const char* ass_filename, const char* outFileName, const cha
 		}
 	}
 
-	ass_set_storage_size(ass_context->ass_renderer, s_info->i_width, s_info->i_height);
-	ass_set_frame_size(ass_context->ass_renderer, s_info->i_width, s_info->i_height);
-
-	if (additional_font_dir)
-		ass_set_fonts_dir(ass_context->ass_library, additional_font_dir);
-
-	ass_set_fonts(ass_context->ass_renderer, NULL, NULL, ASS_FONTPROVIDER_AUTODETECT, NULL, 1);
+	for(int i = 0; i < num_threads; i++)
+	{
+		ass_set_storage_size(ass_context[i]->ass_renderer, s_info->i_width, s_info->i_height);
+		ass_set_frame_size(ass_context[i]->ass_renderer, s_info->i_width, s_info->i_height);
+	
+		if (additional_font_dir)
+			ass_set_fonts_dir(ass_context[i]->ass_library, additional_font_dir);
+	
+		ass_set_fonts(ass_context[i]->ass_renderer, NULL, NULL, ASS_FONTPROVIDER_AUTODETECT, NULL, 1);
+	}
 
 	in_img  = calloc(s_info->i_width * s_info->i_height * 4 + 16 * 2, sizeof(char)); /* allocate + 16 for alignment, and + n * 16 for over read/write */
 	old_img = calloc(s_info->i_width * s_info->i_height * 4 + 16 * 2, sizeof(char)); /* see above */
@@ -397,7 +259,7 @@ int ass2sup_process(const char* ass_filename, const char* outFileName, const cha
 	crops[0].h = pic.h;
 
 	/* Get frame number */
-	frames = get_frame_total_ass(ass_context, s_info);
+	frames = get_frame_total_ass(ass_context[0], s_info);
 	if (count_frames + init_frame > frames)
 	{
 		count_frames = frames - init_frame;
@@ -422,31 +284,34 @@ int ass2sup_process(const char* ass_filename, const char* outFileName, const cha
 			progress_step = 1;
 	}
 
-	/* Open SUP writer, if applicable */
-	if (sup_output)
-		sw = new_sup_writer(sup_output_fn, pic.w, pic.h, fps_num, fps_den);
+	for(int i = 0; i < num_threads; i++)
+	{
+			/* Open SUP writer, if applicable */
+		if (sup_output)
+		{
+			sw[i] = new_sup_writer(sup_output_fn, pic.w, pic.h, fps_num, fps_den);
+		}
+		// ass_set_line_spacing(ass_context[i]->ass_renderer, -10);
+	}
 
 	int changed = 1;
 
-	/* Process frames */
-	ass_set_line_spacing(ass_context->ass_renderer, 48.0);
-
     /* Process frames */
-    int frames_per_thread = count_frames / NUM_THREADS;
+    int frames_per_thread = count_frames / num_threads;
 
-    pthread_t threads[NUM_THREADS];
-    ThreadData thread_data[NUM_THREADS];
+    pthread_t threads[num_threads];
+    ThreadData thread_data[num_threads];
 
-    for (int i = 0; i < NUM_THREADS; i++) {
+    for (int i = 0; i < num_threads; i++) {
         thread_data[i].thread_id = i;
         thread_data[i].init_frame = init_frame + i * frames_per_thread;
-        thread_data[i].last_frame = (i == NUM_THREADS - 1) ? last_frame : (thread_data[i].init_frame + frames_per_thread - 1);
-        thread_data[i].ass_context = ass_context;
+        thread_data[i].last_frame = (i == num_threads - 1) ? last_frame : (thread_data[i].init_frame + frames_per_thread - 1);
+        thread_data[i].ass_context = ass_context[i];
         thread_data[i].s_info = s_info;
         thread_data[i].have_line = have_line;
         thread_data[i].sup_output = sup_output;
         thread_data[i].xml_output = xml_output;
-        thread_data[i].sw = sw;
+        thread_data[i].sw = sw[i];
         thread_data[i].n_crop = n_crop;
         thread_data[i].to = to;
         thread_data[i].split_at = split_at;
@@ -454,7 +319,6 @@ int ass2sup_process(const char* ass_filename, const char* outFileName, const cha
         thread_data[i].stricter = stricter;
         thread_data[i].events = events;
         thread_data[i].buffer_opt = buffer_opt;
-        thread_data[i].pic = pic;
         thread_data[i].ugly = ugly;
         thread_data[i].even_y = even_y;
         thread_data[i].autocrop = autocrop;
@@ -463,7 +327,7 @@ int ass2sup_process(const char* ass_filename, const char* outFileName, const cha
         pthread_create(&threads[i], NULL, process_frames, &thread_data[i]);
     }
 
-    for (int i = 0; i < NUM_THREADS; i++) {
+    for (int i = 0; i < num_threads; i++) {
         pthread_join(threads[i], NULL);
     }
 
@@ -496,9 +360,12 @@ int ass2sup_process(const char* ass_filename, const char* outFileName, const cha
 		end_frame = i - 1;
 	}
 
-	if (sup_output)
+	for(int i = 0; i < num_threads; i++)
 	{
-		close_sup_writer(sw);
+		if (sup_output)
+		{
+			close_sup_writer(sw[i]);
+		}
 	}
 
 	if (xml_output)
@@ -580,7 +447,10 @@ int ass2sup_process(const char* ass_filename, const char* outFileName, const cha
 	}
 
 	/* Cleanup */
-	close_file_ass(ass_context);
+	for(int i = 0; i < num_threads; i++)
+	{
+		close_file_ass(ass_context[i]);
+	}
 
 	/* Give runtime */
 	fprintf(stderr, "Time elapsed: %lld\n", time(NULL) - bench_start);

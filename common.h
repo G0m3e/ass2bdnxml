@@ -130,4 +130,30 @@ struct framerate_entry_s
 void col2rgb(uint32_t *c, uint8_t *r, uint8_t *g, uint8_t *b);
 
 void make_sub_img(ASS_Image *img, uint8_t *sub_img, uint32_t width);
+
+typedef struct {
+    int thread_id;
+    int init_frame;
+    int last_frame;
+    ass_input_t *ass_context;
+    stream_info_t *s_info;
+    int have_line;
+    int sup_output;
+    int xml_output;
+    sup_writer_t *sw;
+    int n_crop;
+    int to;
+    int split_at;
+    int min_split;
+    int stricter;
+    event_list_t *events;
+    int buffer_opt;
+    int ugly;
+    int even_y;
+    int autocrop;
+    int pal_png;
+    char* png_dir;
+} ThreadData;
+
+int process_frames(ThreadData* arg);
 #endif // COMMON_H
