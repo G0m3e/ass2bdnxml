@@ -35,25 +35,40 @@ pkg_check_modules(LIBASS REQUIRED IMPORTED_TARGET libass)
 
 set(SOURCES
     auto_split.c
-    ass2bdnxml.c
     palletize.c
     sort.c
     sup.c
     common.c)
 
-add_executable(ass2bdnxml ${SOURCES})
+add_executable(ass2bdnxml ass2bdnxml.c ${SOURCES})
 
 target_link_libraries(ass2bdnxml 
     PRIVATE 
     ZLIB::ZLIB 
     PNG::PNG
+    vfw32
+    PkgConfig::LIBASS)
+
+add_executable(avs2bdnxml avs2bdnxml.c ${SOURCES})
+
+target_link_libraries(avs2bdnxml
+    PRIVATE
+    ZLIB::ZLIB
+    PNG::PNG
+    vfw32
     PkgConfig::LIBASS)
 
 add_library(ass2sup ${SOURCES}
     ass2sup.c)
 
+target_include_directories(ass2sup PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:ass2sup/include>
+)
+
 target_link_libraries(ass2sup 
     PRIVATE 
     ZLIB::ZLIB 
     PNG::PNG
+    vfw32
     PkgConfig::LIBASS)

@@ -16,9 +16,42 @@
 #include "abstract_lists.h"
 
 #include <ass/ass.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
-#define MAX_PATH 1024
-#define max(a,b) ((a)>(b)?(a):(b))
+#ifndef LINUX
+#include <windows.h>
+#include <vfw.h>
+#endif
+
+// #define MAX_PATH 1024
+// #define max(a,b) ((a)>(b)?(a):(b))
+
+#ifndef LINUX
+static int64_t gcd( int64_t a, int64_t b )
+{
+    while (1)
+    {
+        int64_t c = a % b;
+        if( !c )
+            return b;
+        a = b;
+        b = c;
+    }
+}
+#endif
+
+typedef struct {
+#if !defined(LINUX)
+    PAVISTREAM p_avi;
+#else
+    int fps_den;
+    int fps_num;
+    int frames;
+    FILE *fh;
+#endif
+    int width, height;
+} avis_input_t;
 
 char *read_file_bytes(FILE *fp, size_t *bufsize);
 
@@ -54,6 +87,14 @@ typedef struct {
 	int i_fps_num;
 } stream_info_t;
 
+
+int open_file_avis( char *psz_filename, avis_input_t **p_handle, stream_info_t *p_param );
+int get_frame_total_avis( avis_input_t *handle );
+
+int read_frame_avis( char *p_pic, avis_input_t *handle, int i_frame );
+int close_file_avis( avis_input_t *handle );
+
+
 void msg_callback(int level, const char *fmt, va_list va, void *data);
 
 int open_file_ass( char *psz_filename, ass_input_t **p_handle, stream_info_t *p_param);
@@ -85,22 +126,25 @@ int parse_int(char *in, char *name, int *error);
 
 int parse_tc(char *in, int fps);
 
+int count_non_empty(char *arr[], int size);
+
 typedef struct event_s
 {
-	int image_number;
-	int start_frame;
-	int end_frame;
-	int graphics;
-	crop_t c[2];
+    int image_number;
+    int start_frame;
+    int end_frame;
+    int graphics;
+    int forced;
+    crop_t c[2];
 } event_t;
 
 STATIC_LIST(event, event_t)
 
-void add_event_xml_real (event_list_t *events, int image, int start, int end, int graphics, crop_t *crops);
+void add_event_xml_real (event_list_t *events, int image, int start, int end, int graphics, crop_t *crops, int forced);
 
-void add_event_xml (event_list_t *events, int split_at, int min_split, int start, int end, int graphics, crop_t *crops);
+void add_event_xml (event_list_t *events, int split_at, int min_split, int start, int end, int graphics, crop_t *crops, int forced);
 
-void write_sup_wrapper (sup_writer_t *sw, uint8_t *im, int num_crop, crop_t *crops, uint32_t *pal, int start, int end, int split_at, int min_split, int stricter);
+void write_sup_wrapper (sup_writer_t *sw, uint8_t *im, int num_crop, crop_t *crops, uint32_t *pal, int start, int end, int split_at, int min_split, int stricter, int forced);
 
 struct framerate_entry_s
 {
@@ -136,6 +180,7 @@ typedef struct {
     int init_frame;
     int last_frame;
     ass_input_t *ass_context;
+    avis_input_t* avis_hnd;
     stream_info_t *s_info;
     int have_line;
     int sup_output;
@@ -146,6 +191,7 @@ typedef struct {
     int split_at;
     int min_split;
     int stricter;
+    int mark_forced;
     event_list_t *events;
     int buffer_opt;
     int ugly;
@@ -155,5 +201,15 @@ typedef struct {
     char* png_dir;
 } ThreadData;
 
-int process_frames(ThreadData* arg);
+int ass_process_frames(ThreadData* arg);
+
+int avs_process_frames(ThreadData* arg);
+
+extern pthread_mutex_t mutex;
+extern atomic_int num_of_events;
+extern atomic_int stopFlag;
+
+typedef void (*ProgressCallback)(int progress);
+extern ProgressCallback progress_callback;
+
 #endif // COMMON_H

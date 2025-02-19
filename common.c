@@ -1,10 +1,10 @@
 #include "common.h"
 #include <string.h>
-#include <pthread.h>
-#include <stdatomic.h>
 
-pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER; // 互斥锁
-atomic_int num_of_events = 0;                      // 共享计数
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+atomic_int num_of_events = 0;
+atomic_int stopFlag = 0;
+ProgressCallback progress_callback = NULL;
 
 char *read_file_bytes(FILE *fp, size_t *bufsize)
 {
@@ -88,8 +88,13 @@ int open_file_ass(char *psz_filename, ass_input_t **p_handle, stream_info_t *p_p
 
 	if (!ass_renderer)
 		return 1;
-
-	FILE *fp = fopen(psz_filename, "rb");
+#ifdef _WIN32
+    wchar_t wfilename[512];
+    MultiByteToWideChar(CP_UTF8, 0, psz_filename, -1, wfilename, sizeof(wfilename) / sizeof(wchar_t));
+    FILE *fp = _wfopen(wfilename, L"rb");
+#else
+    FILE *fp = fopen(psz_filename, "rb");
+#endif
 	if (!fp)
 		return 1;
 	size_t bufsize;
@@ -454,55 +459,56 @@ int parse_tc(char *in, int fps)
 	return r;
 }
 
-void add_event_xml_real(event_list_t *events, int image, int start, int end, int graphics, crop_t *crops)
+void add_event_xml_real(event_list_t *events, int image, int start, int end, int graphics, crop_t *crops, int forced)
 {
-	event_t *new = calloc(1, sizeof(event_t));
-	new->image_number = image;
-	new->start_frame = start;
-	new->end_frame = end;
-	new->graphics = graphics;
-	new->c[0] = crops[0];
-	new->c[1] = crops[1];
-	event_list_insert_after(events, new);
+    event_t *new = calloc(1, sizeof(event_t));
+    new->image_number = image;
+    new->start_frame = start;
+    new->end_frame = end;
+    new->graphics = graphics;
+    new->c[0] = crops[0];
+    new->c[1] = crops[1];
+    new->forced = forced;
+    event_list_insert_after(events, new);
 }
 
-void add_event_xml(event_list_t *events, int split_at, int min_split, int start, int end, int graphics, crop_t *crops)
+void add_event_xml(event_list_t *events, int split_at, int min_split, int start, int end, int graphics, crop_t *crops, int forced)
 {
-	int image = start;
-	int d = end - start;
+    int image = start;
+    int d = end - start;
 
-	if (!split_at)
-		add_event_xml_real(events, image, start, end, graphics, crops);
-	else
-	{
-		while (d >= split_at + min_split)
-		{
-			d -= split_at;
-			add_event_xml_real(events, image, start, start + split_at, graphics, crops);
-			start += split_at;
-		}
-		if (d)
-			add_event_xml_real(events, image, start, start + d, graphics, crops);
-	}
+    if (!split_at)
+        add_event_xml_real(events, image, start, end, graphics, crops, forced);
+    else
+    {
+        while (d >= split_at + min_split)
+        {
+            d -= split_at;
+            add_event_xml_real(events, image, start, start + split_at, graphics, crops, forced);
+            start += split_at;
+        }
+        if (d)
+            add_event_xml_real(events, image, start, start + d, graphics, crops, forced);
+    }
 }
 
-void write_sup_wrapper(sup_writer_t *sw, uint8_t *im, int num_crop, crop_t *crops, uint32_t *pal, int start, int end, int split_at, int min_split, int stricter)
+void write_sup_wrapper(sup_writer_t *sw, uint8_t *im, int num_crop, crop_t *crops, uint32_t *pal, int start, int end, int split_at, int min_split, int stricter, int forced)
 {
-	int d = end - start;
+    int d = end - start;
 
-	if (!split_at)
-		write_sup(sw, im, num_crop, crops, pal, start, end, stricter);
-	else
-	{
-		while (d >= split_at + min_split)
-		{
-			d -= split_at;
-			write_sup(sw, im, num_crop, crops, pal, start, start + split_at, stricter);
-			start += split_at;
-		}
-		if (d)
-			write_sup(sw, im, num_crop, crops, pal, start, start + d, stricter);
-	}
+    if (!split_at)
+        write_sup(sw, im, num_crop, crops, pal, start, end, stricter, forced);
+    else
+    {
+        while (d >= split_at + min_split)
+        {
+            d -= split_at;
+            write_sup(sw, im, num_crop, crops, pal, start, start + split_at, stricter, forced);
+            start += split_at;
+        }
+        if (d)
+            write_sup(sw, im, num_crop, crops, pal, start, start + d, stricter, forced);
+    }
 }
 
 void col2rgb(uint32_t *c, uint8_t *r, uint8_t *g, uint8_t *b)
@@ -566,7 +572,124 @@ void make_sub_img(ASS_Image *img, uint8_t *sub_img, uint32_t width)
 	}
 }
 
-int process_frames(ThreadData* data)
+int avs_process_frames(ThreadData* data)
+{
+    char *in_img = NULL, *old_img = NULL, *tmp = NULL, *out_buf = NULL;
+    int first_frame = -1;
+    int checked_empty = 0;
+    int have_line = 0;
+    int must_zero = 0;
+    int n_crop = 1;
+    uint32_t *pal = NULL;
+    crop_t crops[2];
+    int start_frame = -1;
+    int end_frame = -1;
+    in_img  = calloc(data->s_info->i_width * data->s_info->i_height * 4 + 16 * 2, sizeof(char)); /* allocate + 16 for alignment, and + n * 16 for over read/write */
+    old_img = calloc(data->s_info->i_width * data->s_info->i_height * 4 + 16 * 2, sizeof(char)); /* see above */
+    out_buf = calloc(data->s_info->i_width * data->s_info->i_height * 4 + 16 * 2, sizeof(char));
+    pic_t pic;
+    pic.b = out_buf;
+    pic.w = data->s_info->i_width;
+    pic.h = data->s_info->i_height;
+    pic.s = data->s_info->i_width;
+    for (int i = data->init_frame; i <= data->last_frame; i++)
+    {
+        progress_callback(i - data->init_frame);
+        if(stopFlag)
+        {
+            return 2;
+        }
+        pthread_mutex_lock(&mutex);
+        if (read_frame_avis(in_img, data->avis_hnd, i))
+        {
+            fprintf(stderr, "Error reading frame.\n");
+            pthread_mutex_unlock(&mutex);
+            return 1;
+        }
+        pthread_mutex_unlock(&mutex);
+
+        checked_empty = 0;
+        /* If we are outside any lines, check for empty frames first */
+        if (!have_line)
+        {
+            if (is_empty(data->s_info, in_img))
+                continue;
+            else
+                checked_empty = 1;
+        }
+
+        /* Check for duplicate, unless first frame */
+        if ((i != data->init_frame) && have_line && is_identical(data->s_info, in_img, old_img))
+            continue;
+        /* Mark frames that were not used as new image in comparison to have transparent pixels zeroed */
+        else if (!(i && have_line))
+            must_zero = 1;
+
+        /* Not a dup, write end-of-line, if we had a line before */
+        if (have_line)
+        {
+            if (data->sup_output)
+            {
+                assert(pal != NULL);
+                write_sup_wrapper(data->sw, (uint8_t *)out_buf, n_crop, crops, pal, start_frame + data->to, i + data->to, data->split_at, data->min_split, data->stricter, 0);
+                if (!data->xml_output)
+                    free(pal);
+                pal = NULL;
+            }
+            if (data->xml_output)
+                add_event_xml(data->events, data->split_at, data->min_split, start_frame + data->to, i + data->to, n_crop, crops, 0);
+            end_frame = i;
+            have_line = 0;
+        }
+
+        /* Check for empty frame, if we didn't before */
+        if (!checked_empty && is_empty(data->s_info, in_img))
+            continue;
+
+        /* Zero transparent pixels, if needed */
+        if (must_zero)
+            zero_transparent(data->s_info, in_img);
+        must_zero = 0;
+
+        /* Not an empty frame, start line */
+        have_line = 1;
+        start_frame = i;
+        swap_rb(data->s_info, in_img, out_buf);
+        if (data->buffer_opt)
+            n_crop = auto_split(pic, crops, data->ugly, data->even_y);
+        else if (data->autocrop)
+        {
+            crops[0].x = 0;
+            crops[0].y = 0;
+            crops[0].w = pic.w;
+            crops[0].h = pic.h;
+            auto_crop(pic, crops);
+        }
+        if ((data->buffer_opt || data->autocrop) && data->even_y)
+            enforce_even_y(crops, n_crop);
+        if ((data->pal_png || data->sup_output) && pal == NULL)
+            pal = palletize(out_buf, data->s_info->i_width, data->s_info->i_height);
+        if (data->xml_output)
+            for (int j = 0; j < n_crop; j++)
+                write_png(data->png_dir, start_frame, (uint8_t *)out_buf, data->s_info->i_width, data->s_info->i_height, j, pal, crops[j]);
+        if (data->pal_png && data->xml_output && !data->sup_output)
+        {
+            free(pal);
+            pal = NULL;
+        }
+        num_of_events++;
+        if (first_frame == -1)
+            first_frame = i;
+
+        /* Save image for next comparison. */
+        tmp = in_img;
+        in_img = old_img;
+        old_img = tmp;
+    }
+    return 0;
+}
+
+int ass_process_frames(ThreadData* data)
 {
     char *in_img = NULL, *old_img = NULL, *tmp = NULL, *out_buf = NULL;
     int changed = 1;
@@ -592,10 +715,11 @@ int process_frames(ThreadData* data)
 	pic.s = data->s_info->i_width;
     for (int i = data->init_frame; i <= data->last_frame; i++)
     {
-        // if(stopFlag)
-        // {
-        //     return 2;
-        // }
+        progress_callback(i - data->init_frame);
+        if(stopFlag)
+        {
+            return 2;
+        }
 		long long ts = (long double)i * data->s_info->i_fps_den / data->s_info->i_fps_num * 1000;
         // pthread_mutex_lock(&mutex);
         ASS_Image *img = ass_render_frame(data->ass_context->ass_renderer, data->ass_context->ass, ts, &changed);
@@ -634,13 +758,13 @@ int process_frames(ThreadData* data)
 			if (data->sup_output)
 			{
 				assert(pal != NULL);
-				write_sup_wrapper(data->sw, (uint8_t *)out_buf, n_crop, crops, pal, start_frame + data->to, i + data->to, data->split_at, data->min_split, data->stricter);
+                write_sup_wrapper(data->sw, (uint8_t *)out_buf, n_crop, crops, pal, start_frame + data->to, i + data->to, data->split_at, data->min_split, data->stricter, 0);
 				if (!data->xml_output)
 					free(pal);
 				pal = NULL;
 			}
 			if (data->xml_output)
-				add_event_xml(data->events, data->split_at, data->min_split, start_frame + data->to, i + data->to, n_crop, crops);
+                add_event_xml(data->events, data->split_at, data->min_split, start_frame + data->to, i + data->to, n_crop, crops, 0);
 			end_frame = i;
 			have_line = 0;
 		}
@@ -693,4 +817,127 @@ int process_frames(ThreadData* data)
 		in_img = old_img;
 		old_img = tmp;
     }
+}
+
+int open_file_avis(char *psz_filename, avis_input_t **p_handle, stream_info_t *p_param)
+{
+    avis_input_t *h = malloc(sizeof(avis_input_t));
+#if !defined(LINUX)
+    AVISTREAMINFO info;
+    int i;
+
+    *p_handle = h;
+
+    AVIFileInit();
+    if( AVIStreamOpenFromFile( &h->p_avi, psz_filename, streamtypeVIDEO, 0, OF_READ, NULL ) )
+    {
+        AVIFileExit();
+        return -1;
+    }
+
+    if( AVIStreamInfo(h->p_avi, &info, sizeof(AVISTREAMINFO)) )
+    {
+        AVIStreamRelease(h->p_avi);
+        AVIFileExit();
+        return -1;
+    }
+
+    /* Check input format */
+    if (info.fccHandler != MAKEFOURCC('D', 'I', 'B', ' '))
+    {
+        fprintf( stderr, "avis [error]: unsupported input format (%c%c%c%c)\n",
+                (char)(info.fccHandler & 0xff), (char)((info.fccHandler >> 8) & 0xff),
+                (char)((info.fccHandler >> 16) & 0xff), (char)((info.fccHandler >> 24)) );
+
+        AVIStreamRelease(h->p_avi);
+        AVIFileExit();
+
+        return -1;
+    }
+
+    h->width =
+        p_param->i_width = info.rcFrame.right - info.rcFrame.left;
+    h->height =
+        p_param->i_height = info.rcFrame.bottom - info.rcFrame.top;
+    i = gcd(info.dwRate, info.dwScale);
+    p_param->i_fps_den = info.dwScale / i;
+    p_param->i_fps_num = info.dwRate / i;
+
+    fprintf( stderr, "avis [info]: %dx%d @ %.2f fps (%d frames)\n",
+            p_param->i_width, p_param->i_height,
+            (double)p_param->i_fps_num / (double)p_param->i_fps_den,
+            (int)info.dwLength );
+
+    return 0;
+#else
+    *p_handle = h;
+    p_param->i_width = 1920;
+    p_param->i_height = 1080;
+    p_param->i_fps_den = 30000;
+    p_param->i_fps_num = 1001;
+    h->width = p_param->i_width;
+    h->height = p_param->i_height;
+    h->fps_den = p_param->i_fps_den;
+    h->fps_num = p_param->i_fps_num;
+    h->fh = fopen(psz_filename, "r");
+    h->frames = 15000;
+    return 0;
+#endif
+}
+
+int get_frame_total_avis(avis_input_t *handle)
+{
+#if !defined(LINUX)
+    avis_input_t *h = handle;
+    AVISTREAMINFO info;
+
+    if( AVIStreamInfo(h->p_avi, &info, sizeof(AVISTREAMINFO)) )
+        return -1;
+
+    return info.dwLength;
+#else
+    return handle->frames;
+#endif
+}
+
+
+int read_frame_avis(char *p_pic, avis_input_t *handle, int i_frame)
+{
+#if !defined(LINUX)
+    avis_input_t *h = handle;
+
+    if( AVIStreamRead(h->p_avi, i_frame, 1, p_pic, h->width * h->height * 4, NULL, NULL ) )
+        return -1;
+
+    return 0;
+#else
+    fread(p_pic, 4, handle->width * handle->height, handle->fh);
+    return 0;
+#endif
+}
+
+
+int close_file_avis(avis_input_t *handle)
+{
+#if !defined(LINUX)
+    avis_input_t *h = handle;
+    AVIStreamRelease(h->p_avi);
+    AVIFileExit();
+    free(h);
+    return 0;
+#else
+    fclose((FILE *)handle);
+    return 0;
+#endif
+}
+
+int count_non_empty(char *arr[], int size)
+{
+    int count = 0;
+    for (int i = 0; i < size; i++) {
+        if (arr[i] != NULL) {
+            count++;
+        }
+    }
+    return count;
 }

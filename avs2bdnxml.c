@@ -1,8 +1,6 @@
 /*----------------------------------------------------------------------------
- * ass2bdnxml - Generates BluRay subtitle stuff from ass/ssa subtitles
- * based on avs2bdnxml 2.08
+ * avs2bdnxml - Generates BluRay subtitle stuff from RGBA AviSynth scripts
  * Copyright (C) 2008-2013 Arne Bochem <avs2bdnxml at ps-auxw de>
- * Copyright (C) 2022-2022 Masaiki <mydarer@gmail.com>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,14 +14,157 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *----------------------------------------------------------------------------
+ * Version 2.09
+ *   - Added parameter -F to mark all subtitles forced
+ *
+ * Version 2.08
+ *   - Fix PNG filename references when used with timecode offsets
+ *
+ * Version 2.07
+ *   - Fix two bugs in timecode parsing function
+ *   - Move most inline assembly to yasm
+ *
+ * Version 2.06
+ *   - Add option to add an offset to output timecodes
+ *   - Change return value when no events were detected to 0
+ *   - Add option to allow writing of empty output files
+ *   - Add option to enforce even Y coordinates (may help avoid problems with
+ *     interlaced video in DVD related use cases)
+ *   - Fix SSE2 with more recent GCC versions
+ *   - Add option for stricter checks on buffer/palette limits for SUPs
+ *   - Fix bug where LastEventOutTC could be one frame early
+ *   - Add additional checks to commandline argument parsing
+ *   - PNG files are now always placed in the same directory as the XML file
+ *
+ * Version 2.05
+ *   - Fix crash when using XML and SUP output
+ *
+ * Version 2.04
+ *   - Minor fixes
+ *   - Code cleanup regarding linked lists
+ *   - Add new minimal window finding code
+ *   - Fix PGS output more, especially WDS handling
+ *   - Fix old bug in RLE encoder
+ *
+ * Version 2.03
+ *   - Output some statistics about previous epoch in pgsparse in end packet
+ *   - Fix unnecessary epoch splits due to bad buffer calculation and more.
+ *   - Some small fixes
+ *
+ * Version 2.02
+ *   - It is now possible to use -o twice, with different output formats
+ *   - Corrections to SUP timestamp calculation
+ *   - PGS decode buffer should contain palettized image data, not RGBA.
+ *     Buffer usage calculation fixed.
+ *
+ * Version 2.01
+ *   - Restrict number of composition objects within an epoch to 64
+ *
+ * Version 2.00
+ *   - Options --seek and --count were added, to allow for partial processing
+ *     of input video
+ *   - For debug purposes, a stand-alone SUP file parser was added in debug/
+ *   - Experimental SUP output support
+ *
+ * Version 1.13
+ *   - By default, images are no longer split into to composition objects,
+ *     if the result would look ugly. For example, descenders should no
+ *     longer get put into their own image. Reverting back to the old
+ *     behaviour is possible using the --ugly option.
+ *   - Ensure minimum size of 8x8 for composition objects
+ *
+ * Version 1.12
+ *   - Fix error in example
+ *   - Fix double free, which could result in broken images when image
+ *     splitting and palletized output were enabled.
+ *
+ * Version 1.11
+ *   - Add option to not split lines, if the rest isn't a minimum
+ *     of 3 (default) frames long
+ *   - Images are now autocropped by default
+ *   - Images are now converted to 8bit palette by default
+ *   - Misc bugfixes that should've been fixed before
+ *
+ * Version 1.10b
+ *   - Splitting of images is now disabled by default
+ *
+ * Version 1.10
+ *   - Add option to split events longer than a given number of frames, to
+ *     allow better seeking
+ *   - Change image filename format to XXXXXXXX_X.png
+ *   - Add option to optimize for Presentation Graphics buffer usage, by
+ *     auto-cropping images, and splitting them into two separate ones to
+ *     minimize surface area, when necessary (enabled by default)
+ *   - Use getopts for commandline argument parsing
+ *   - Add Makefile
+ *
+ * Version 1.9
+ *   - Correct calculation of timecodes. Integer only, now.
+ *   - Remove support for drop timecodes. If anybody really needs them, and
+ *     has a way to check calculated timecodes are correct, please tell me.
+ *
+ * Version 1.8
+ *   - Fix crash with certain frame sizes (unaligned buffer used with SSE2)
+ *
+ * Version 1.7
+ *   - Terminate using exit/return instead of abort (no more "crashes")
+ *
+ * Version 1.6
+ *   - Zero transparent pixels to guard against invisible color information
+ *     (Slight slowdown, but more robustness)
+ *   - Add SSE2 runtime detection
+ *   - Correctly set DropFrame attribute
+ *
+ * Version 1.5
+ *   - Validate framerates
+ *   - Make non-drop timecodes the default for 23.976, 29.97 and 59.94
+ *   - Fix bad timecode calculation due to float math optimization
+ *   - Add integer SSE2 optimization (but most time is spent in AviSynth)
+ *   - Don't uselessly swap R and B channels
+ *
+ * Version 1.4
+ *   - Add 30 to framerate list
+ *   - Enhance timecode precision
+ *
+ * Version 1.3
+ *   - Read frames correctly in avs2bdnxml. No more FlipVertical() necessary.
+ *
+ * Version 1.2
+ *   - Fixed bug, where only the bottom part of the image was checked for
+ *     changes
+ *
+ * Version 1.1
+ *   - Fixed crash bug with videos shorter than 1000 frames.
+ *   - Convert from BGR to RGB, colors in PNGs should be correct now.
+ *
+ * Version 1.0
+ *   - Initial release. Seems to work.
+ *----------------------------------------------------------------------------
+ * Thanks to:
+ *   - hamletiii on Doom9 for a steady flow of feedback.
+ *   - Daiz in #x264 for inspiration, testing, and bug reports.
+ *   - Loren Merritt and Laurent Aimar for writing x264's AVS reader code.
  *----------------------------------------------------------------------------*/
-#include "common.h"
-#include <pthread.h>
-// codes from assrender end here
 
+#include "common.h"
+#include <time.h>
+
+/* Most of the time seems to be spent in AviSynth (about 4/5). */
 int main (int argc, char *argv[])
 {
-	char *ass_filename = NULL;
+	struct framerate_entry_s framerates[] = { {"23.976", "23.976", 24, 0, 24000, 1001}
+	                                        /*, {"23.976d", "23.976", 24000/1001.0, 1}*/
+	                                        , {"24", "24", 24, 0, 24, 1}
+	                                        , {"25", "25", 25, 0, 25, 1}
+	                                        , {"29.97", "29.97", 30, 0, 30000, 1001}
+	                                        /*, {"29.97d", "29.97", 30000/1001.0, 1}*/
+	                                        , {"50", "50", 50, 0, 50, 1}
+	                                        , {"59.94", "59.94", 60, 0, 60000, 1001}
+	                                        /*, {"59.94d", "59.94", 60000/1001.0, 1}*/
+	                                        , {NULL, NULL, 0, 0, 0, 0}
+	                                        };
+	char *avs_filename = NULL;
 	char *track_name = "Undefined";
 	char *language = "und";
 	char *video_format = "1080p";
@@ -31,8 +172,6 @@ int main (int argc, char *argv[])
 	char *out_filename[2] = {NULL, NULL};
 	char *sup_output_fn = NULL;
 	char *xml_output_fn = NULL;
-
-
 	char *x_offset = "0";
 	char *y_offset = "0";
 	char *t_offset = "0";
@@ -47,14 +186,11 @@ int main (int argc, char *argv[])
 	char *allow_empty_string = "0";
 	char *stricter_string = "0";
 	char *count_string = "2147483647";
-	char * num_threads_string = "4";
-
-
 	char *in_img = NULL, *old_img = NULL, *tmp = NULL, *out_buf = NULL;
 	char *intc_buf = NULL, *outtc_buf = NULL;
 	char *drop_frame = NULL;
+    char *mark_forced_string = "0";
 	char png_dir[MAX_PATH + 1] = {0};
-	const char *additional_font_dir = NULL;
 	crop_t crops[2];
 	pic_t pic;
 	uint32_t *pal = NULL;
@@ -70,6 +206,7 @@ int main (int argc, char *argv[])
 	int init_frame = 0;
 	int frames;
 	int first_frame = -1, start_frame = -1, end_frame = -1;
+	int num_of_events = 0;
 	int i, c, j;
 	int have_line = 0;
 	int must_zero = 0;
@@ -80,13 +217,15 @@ int main (int argc, char *argv[])
 	int ugly = 0;
 	int progress_step = 1000;
 	int buffer_opt;
-	long long bench_start = time(NULL);
+	int bench_start = time(NULL);
 	int fps_num = 25, fps_den = 1;
 	int sup_output = 0;
 	int xml_output = 0;
 	int allow_empty = 0;
 	int stricter = 0;
-	int num_threads = 4;
+    int mark_forced = 0;
+	sup_writer_t *sw = NULL;
+	avis_input_t *avis_hnd;
 	stream_info_t *s_info = malloc(sizeof(stream_info_t));
 	event_list_t *events = event_list_new();
 	event_t *event;
@@ -120,13 +259,12 @@ int main (int argc, char *argv[])
 			, {"ugly",         required_argument, 0, 'u'}
 			, {"null-xml",     required_argument, 0, 'n'}
 			, {"stricter",     required_argument, 0, 'z'}
-			, {"font-dir",     required_argument, 0, 'g'}
-			, {"thread-num",   required_argument, 0, 'i'}
+			, {"forced",       required_argument, 0, 'F'}
 			, {0, 0, 0, 0}
 			};
 			int option_index = 0;
 
-			c = getopt_long(argc, argv, "o:j:c:t:l:v:f:x:y:d:b:s:m:e:p:a:u:n:z:g:i:", long_options, &option_index);
+			c = getopt_long(argc, argv, "o:j:c:t:l:v:f:x:y:d:b:s:m:e:p:a:u:n:z:F:", long_options, &option_index);
 			if (c == -1)
 				break;
 			switch (c)
@@ -194,11 +332,8 @@ int main (int argc, char *argv[])
 				case 'z':
 					stricter_string = optarg;
 					break;
-				case 'g':
-					additional_font_dir = optarg;
-					break;
-				case 'i':
-					num_threads_string = optarg;
+				case 'F':
+					mark_forced_string = optarg;
 					break;
 				default:
 					print_usage();
@@ -207,7 +342,7 @@ int main (int argc, char *argv[])
 			}
 	}
 	if (argc - optind == 1)
-		ass_filename = argv[optind];
+		avs_filename = argv[optind];
 	else
 	{
 		fprintf(stderr, "Only a single input file allowed.\n");
@@ -215,7 +350,7 @@ int main (int argc, char *argv[])
 	}
 
 	/* Both input and output filenames are required */
-	if (ass_filename == NULL)
+	if (avs_filename == NULL)
 	{
 		print_usage();
 		return 0;
@@ -225,8 +360,6 @@ int main (int argc, char *argv[])
 		print_usage();
 		return 0;
 	}
-
-	memset(s_info, 0, sizeof(stream_info_t));
 
 	/* Get target output format */
 	for (i = 0; i < out_filename_idx; i++)
@@ -268,29 +401,11 @@ int main (int argc, char *argv[])
 	init_frame = parse_int(seek_string, "seek", NULL);
 	count_frames = parse_int(count_string, "count", NULL);
 	min_split = parse_int(minimum_split, "min-split", NULL);
-	num_threads = parse_int(num_threads_string, "thread-num", NULL);
-	if(num_threads <=0 || num_threads >16)
-	{
-		return -1;
-	}
-	ass_input_t *ass_context[num_threads];
-	sup_writer_t *sw[num_threads];
 	if (!min_split)
 		min_split = 1;
+	mark_forced = parse_int(mark_forced_string, "forced", NULL);
 
-    struct framerate_entry_s framerates[] = { {"23.976", "23.976", 24, 0, 24000, 1001}
-        /*, {"23.976d", "23.976", 24000/1001.0, 1}*/
-        , {"24", "24", 24, 0, 24, 1}
-        , {"25", "25", 25, 0, 25, 1}
-        , {"29.97", "29.97", 30, 0, 30000, 1001}
-        , {"30", "30", 30, 0, 30, 1}
-        /*, {"29.97d", "29.97", 30000/1001.0, 1}*/
-        , {"50", "50", 50, 0, 50, 1}
-        , {"59.94", "59.94", 60, 0, 60000, 1001}
-        , {"60", "60", 60, 0, 60, 1}
-        /*, {"59.94d", "59.94", 60000/1001.0, 1}*/
-        , {NULL, NULL, 0, 0, 0, 0}
-    };
+	/* TODO: Sanity check video_format and frame_rate. */
 
 	/* Get frame rate */
 	i = 0;
@@ -301,20 +416,14 @@ int main (int argc, char *argv[])
 			frame_rate = framerates[i].out_name;
 			fps = framerates[i].rate;
 			drop_frame = framerates[i].drop ? "true" : "false";
-			s_info->i_fps_num = fps_num = framerates[i].fps_num;
-			s_info->i_fps_den = fps_den = framerates[i].fps_den;
+			fps_num = framerates[i].fps_num;
+			fps_den = framerates[i].fps_den;
 			have_fps = 1;
 		}
 		i++;
 	}
 	if (!have_fps)
 	{
-		if (sscanf(frame_rate, "%d/%d", &fps_num, &fps_den) == 2){
-			drop_frame = "false";
-			s_info->i_fps_num = fps_num;
-			s_info->i_fps_den = fps_den;
-			have_fps = 1;
-		}
 		fprintf(stderr, "Error: Invalid framerate (%s).\n", frame_rate);
 		return 1;
 	}
@@ -322,51 +431,12 @@ int main (int argc, char *argv[])
 	/* Get timecode offset. */
 	to = parse_tc(t_offset, fps);
 
-	/* Detect CPU features
-	detect_sse2();*/
-
 	/* Get video info and allocate buffer */
-	for(int i = 0; i < num_threads; i++)
+	if (open_file_avis(avs_filename, &avis_hnd, s_info))
 	{
-		if (open_file_ass(ass_filename, &ass_context[i], s_info))
-		{
-			print_usage();
-			return 1;
-		}
+		print_usage();
+		return 1;
 	}
-
-
-	char *video_formats[] = { "2k","1440p","1080p","720p" };
-	int video_format_widths[] = { 2560,2560,1920,1280 };
-	int video_format_heights[] = { 1440,1440,1080,720 };
-	int video_format_matched = 0;
-	for (int ii = 0; ii < 4; ++ii) {
-		if (!strcasecmp(video_format, video_formats[ii])) {
-			s_info->i_width = video_format_widths[ii];
-			s_info->i_height = video_format_heights[ii];
-			video_format_matched = 1;
-		}
-	}
-	if (video_format && !video_format_matched)
-	{
-		if (sscanf(video_format,"%d*%d", &s_info->i_width, &s_info->i_height) != 2){
-			fprintf(stderr, "Error: Invalid video_format (%s).\n", video_format);
-			return 1;
-		}
-	}
-
-	for(int i = 0; i < num_threads; i++)
-	{
-		ass_set_storage_size(ass_context[i]->ass_renderer, s_info->i_width, s_info->i_height);
-		ass_set_frame_size(ass_context[i]->ass_renderer, s_info->i_width, s_info->i_height);
-	
-		if (additional_font_dir)
-			ass_set_fonts_dir(ass_context[i]->ass_library, additional_font_dir);
-	
-		ass_set_fonts(ass_context[i]->ass_renderer, NULL, NULL, ASS_FONTPROVIDER_AUTODETECT, NULL, 1);
-	}
-
-
 	in_img  = calloc(s_info->i_width * s_info->i_height * 4 + 16 * 2, sizeof(char)); /* allocate + 16 for alignment, and + n * 16 for over read/write */
 	old_img = calloc(s_info->i_width * s_info->i_height * 4 + 16 * 2, sizeof(char)); /* see above */
 	out_buf = calloc(s_info->i_width * s_info->i_height * 4 + 16 * 2, sizeof(char));
@@ -396,8 +466,7 @@ int main (int argc, char *argv[])
 	crops[0].h = pic.h;
 
 	/* Get frame number */
-	frames = get_frame_total_ass(ass_context[i], s_info);
-	
+	frames = get_frame_total_avis(avis_hnd);
 	if (count_frames + init_frame > frames)
 	{
 		count_frames = frames - init_frame;
@@ -422,53 +491,118 @@ int main (int argc, char *argv[])
 			progress_step = 1;
 	}
 
-	int changed = 1;
+	/* Open SUP writer, if applicable */
+	if (sup_output)
+		sw = new_sup_writer(sup_output_fn, pic.w, pic.h, fps_num, fps_den);
 
 	/* Process frames */
-	for(int i = 0; i < num_threads; i++)
+	for (i = init_frame; i < last_frame; i++)
 	{
-			/* Open SUP writer, if applicable */
-		if (sup_output)
+		// clock_t start = clock();
+		struct timespec start, end;
+		clock_gettime(CLOCK_MONOTONIC, &start);
+		if (read_frame_avis(in_img, avis_hnd, i))
 		{
-			sw[i] = new_sup_writer(sup_output_fn, pic.w, pic.h, fps_num, fps_den);
+			fprintf(stderr, "Error reading frame.\n");
+			return 1;
 		}
-		// ass_set_line_spacing(ass_context[i]->ass_renderer, -10);
-	}
-	
-	    /* Process frames */
-		int frames_per_thread = count_frames / num_threads;
+		checked_empty = 0;
 
-		pthread_t threads[num_threads];
-		ThreadData thread_data[num_threads];
-	
-		for (int i = 0; i < num_threads; i++) {
-			thread_data[i].thread_id = i;
-			thread_data[i].init_frame = init_frame + i * frames_per_thread;
-			thread_data[i].last_frame = (i == num_threads - 1) ? last_frame : (thread_data[i].init_frame + frames_per_thread - 1);
-			thread_data[i].ass_context = ass_context[i];
-			thread_data[i].s_info = s_info;
-			thread_data[i].have_line = have_line;
-			thread_data[i].sup_output = sup_output;
-			thread_data[i].xml_output = xml_output;
-			thread_data[i].sw = sw[i];
-			thread_data[i].n_crop = n_crop;
-			thread_data[i].to = to;
-			thread_data[i].split_at = split_at;
-			thread_data[i].min_split = min_split;
-			thread_data[i].stricter = stricter;
-			thread_data[i].events = events;
-			thread_data[i].buffer_opt = buffer_opt;
-			thread_data[i].ugly = ugly;
-			thread_data[i].even_y = even_y;
-			thread_data[i].autocrop = autocrop;
-			thread_data[i].pal_png = pal_png;
-			thread_data[i].png_dir = png_dir;
-            pthread_create(&threads[i], NULL, ass_process_frames, &thread_data[i]);
+		/* Progress indicator */
+		// if (i % (count_frames / progress_step) == 0)
+		// {
+		// 	fprintf(stderr, "\rProgress: %d/%d - Lines: %d", i - init_frame, count_frames, num_of_events);
+		// }
+
+		/* If we are outside any lines, check for empty frames first */
+		if (!have_line)
+		{
+			if (0)
+				continue;
+			else
+				checked_empty = 1;
 		}
-	
-		for (int i = 0; i < num_threads; i++) {
-			pthread_join(threads[i], NULL);
+
+		/* Check for duplicate, unless first frame */
+		if ((i != init_frame) && have_line && is_identical(s_info, in_img, old_img))
+		{
+			printf("is same %d\n", i);
+			clock_gettime(CLOCK_MONOTONIC, &end);
+		
+			long elapsed_us = (end.tv_sec - start.tv_sec) * 1000000L + (end.tv_nsec - start.tv_nsec) / 1000L; // 转换为微秒
+			printf("judge time: %ld us\n", elapsed_us);
+			continue;
 		}
+		/* Mark frames that were not used as new image in comparison to have transparent pixels zeroed */
+		else if (!(i && have_line))
+			must_zero = 1;
+
+		/* Not a dup, write end-of-line, if we had a line before */
+		if (have_line)
+		{
+			if (sup_output)
+			{
+				assert(pal != NULL);
+				write_sup_wrapper(sw, (uint8_t *)out_buf, n_crop, crops, pal, start_frame + to, i + to, split_at, min_split, stricter, mark_forced);
+				if (!xml_output)
+					free(pal);
+				pal = NULL;
+			}
+			if (xml_output)
+				add_event_xml(events, split_at, min_split, start_frame + to, i + to, n_crop, crops, mark_forced);
+			end_frame = i;
+			have_line = 0;
+		}
+
+		clock_gettime(CLOCK_MONOTONIC, &end);
+		
+		long elapsed_us = (end.tv_sec - start.tv_sec) * 1000000L + (end.tv_nsec - start.tv_nsec) / 1000L; // 转换为微秒
+		printf("execution time: %ld us\n", elapsed_us);
+
+		/* Check for empty frame, if we didn't before */
+		if (!checked_empty && is_empty(s_info, in_img))
+			continue;
+
+		/* Zero transparent pixels, if needed */
+		if (must_zero)
+			zero_transparent(s_info, in_img);
+		must_zero = 0;
+
+		/* Not an empty frame, start line */
+		have_line = 1;
+		start_frame = i;
+		swap_rb(s_info, in_img, out_buf);
+		if (buffer_opt)
+			n_crop = auto_split(pic, crops, ugly, even_y);
+		else if (autocrop)
+		{
+			crops[0].x = 0;
+			crops[0].y = 0;
+			crops[0].w = pic.w;
+			crops[0].h = pic.h;
+			auto_crop(pic, crops);
+		}
+		if ((buffer_opt || autocrop) && even_y)
+			enforce_even_y(crops, n_crop);
+		if ((pal_png || sup_output) && pal == NULL)
+			pal = palletize(out_buf, s_info->i_width, s_info->i_height);
+		if (xml_output)
+			for (j = 0; j < n_crop; j++)
+				write_png(png_dir, start_frame, (uint8_t *)out_buf, s_info->i_width, s_info->i_height, j, pal, crops[j]);
+		if (pal_png && xml_output && !sup_output)
+		{
+			free(pal);
+			pal = NULL;
+		}
+		num_of_events++;
+		if (first_frame == -1)
+			first_frame = i;
+
+		/* Save image for next comparison. */
+		tmp = in_img;
+		in_img = old_img;
+		old_img = tmp;
+	}
 
 	fprintf(stderr, "\rProgress: %d/%d - Lines: %d - Done\n", i - init_frame, count_frames, num_of_events);
 
@@ -478,14 +612,14 @@ int main (int argc, char *argv[])
 		if (sup_output)
 		{
 			assert(pal != NULL);
-            write_sup_wrapper(sw, (uint8_t *)out_buf, n_crop, crops, pal, start_frame + to, i - 1 + to, split_at, min_split, stricter, 0);
+			write_sup_wrapper(sw, (uint8_t *)out_buf, n_crop, crops, pal, start_frame + to, i - 1 + to, split_at, min_split, stricter, mark_forced);
 			if (!xml_output)
 				free(pal);
 			pal = NULL;
 		}
 		if (xml_output)
 		{
-            add_event_xml(events, split_at, min_split, start_frame + to, i - 1 + to, n_crop, crops, 0);
+			add_event_xml(events, split_at, min_split, start_frame + to, i - 1 + to, n_crop, crops, mark_forced);
 			free(pal);
 			pal = NULL;
 		}
@@ -493,12 +627,9 @@ int main (int argc, char *argv[])
 		end_frame = i - 1;
 	}
 
-	for(int i = 0; i < num_threads; i++)
+	if (sup_output)
 	{
-		if (sup_output)
-		{
-			close_sup_writer(sw[i]);
-		}
+		close_sup_writer(sw);
 	}
 
 	if (xml_output)
@@ -555,13 +686,13 @@ int main (int argc, char *argv[])
 			{
 				mk_timecode(event->start_frame, fps, intc_buf);
 				mk_timecode(event->end_frame, fps, outtc_buf);
-				
+
 				if (auto_cut && event->end_frame == frames - 1)
 				{
 					mk_timecode(event->end_frame + 1, fps, outtc_buf);
 				}
-				
-				fprintf(fh, "<Event Forced=\"False\" InTC=\"%s\" OutTC=\"%s\">\n", intc_buf, outtc_buf);
+
+				fprintf(fh, "<Event Forced=\"%s\" InTC=\"%s\" OutTC=\"%s\">\n", (event->forced ? "True" : "False"), intc_buf, outtc_buf);
 				for (i = 0; i < event->graphics; i++)
 				{
 					fprintf(fh, "<Graphic Width=\"%d\" Height=\"%d\" X=\"%d\" Y=\"%d\">%08d_%d.png</Graphic>\n", event->c[i].w, event->c[i].h, xo + event->c[i].x, yo + event->c[i].y, event->image_number - to, i);
@@ -580,13 +711,11 @@ int main (int argc, char *argv[])
 	}
 
 	/* Cleanup */
-	for(int i = 0; i < num_threads; i++)
-	{
-		close_file_ass(ass_context[i]);
-	}
+	close_file_avis(avis_hnd);
 
 	/* Give runtime */
-	fprintf(stderr, "Time elapsed: %lld\n", time(NULL) - bench_start);
+	if (0)
+        fprintf(stderr, "Time elapsed: %llu\n", time(NULL) - bench_start);
 
 	return 0;
 }
